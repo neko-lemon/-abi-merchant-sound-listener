@@ -15,7 +15,7 @@ TITLE = '商人听金'
 def _report(exc: BaseException) -> None:
     message = f'启动失败：{exc!r}'
     try:
-        from winhook import log_error, log_path
+        from winutil import log_error, log_path
 
         log_error('启动失败', exc)
         message += f'\n\n日志：{log_path()}'

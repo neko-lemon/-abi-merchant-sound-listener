@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import queue
 import threading
 import time
@@ -17,29 +16,15 @@ from PIL import ImageTk
 from matcher import CAPTURE_RATE, Matcher
 from resources import CATEGORY_ZH, catalog
 from textimg import stroked_line
-from winhook import (
-    MOD_ALT,
-    WM_LBUTTONDOWN,
-    WM_MOUSEWHEEL,
-    HookPoint,
-    Hotkeys,
-    MouseHook,
-    detect_dpi_scale,
-    log_error,
-    log_path,
-)
+from winutil import Hotkeys, log_error, log_path
 
 WINDOW_BG = '#101824'
 WINDOW_SECONDS = 2.3
 HIGH_VALUE_PRICE = 1_000_000
-WHEEL_LINE = 120
+MOD_ALT = 0x0001
 HOTKEY_LISTEN = 1
 HOTKEY_HIDE = 2
 HOTKEY_KEYS = {(MOD_ALT, 0x34): HOTKEY_LISTEN, (MOD_ALT, 0x35): HOTKEY_HIDE}  # Alt+4 / Alt+5
-
-
-def _inside(rects: tuple, x: int, y: int) -> bool:
-    return any(rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3] for rect in rects)
 
 
 class App:
@@ -60,7 +45,6 @@ class App:
         self.auto = tk.BooleanVar(value=True)
         self.pin_window = tk.BooleanVar(value=True)
         self.bg_transparent = tk.BooleanVar(value=True)
-        self.enhance = tk.BooleanVar(value=True)
         self.panel_opacity = tk.IntVar(value=100)
         self.status = tk.StringVar(value='正在加载参考音效…')
         self.last_confidence = ''
@@ -75,17 +59,10 @@ class App:
         self.last_ranked: list[tuple[int, str, float]] = []
         self.last_metric = 'cos'
         self.photos: list[ImageTk.PhotoImage] = []
-        self._wheel_pending = 0
-        self._wheel_rects: tuple = ()
-        self._click_rects: tuple = ()
-        self.dpi_scale = detect_dpi_scale(root.winfo_screenwidth())
-        self.hook = MouseHook(self._on_mouse)
         self.hotkeys = Hotkeys(HOTKEY_KEYS)
 
         self._build()
         self.status.trace_add('write', self._sync_status_label)
-        for sequence in ('<Configure>', '<Map>', '<Unmap>'):
-            self.root.bind(sequence, self._update_rects)
         self._apply_transparency()
         self._apply_opacity()
         self._toggle_pin()
@@ -94,7 +71,6 @@ class App:
         threading.Thread(target=self._load_matcher, daemon=True, name='matcher').start()
 
         root.after(75, self._drain_messages)
-        root.after(120, self._sync_hook)
         root.after(250, self._auto_tick)
         root.after(800, self._keep_popups_usable)
         root.after(1200, self._report_hotkey_failures)
@@ -140,9 +116,6 @@ class App:
         overlay.pack(fill='x', pady=(0, 8))
         ttk.Checkbutton(overlay, text='背景透明（鼠标可穿透）', variable=self.bg_transparent,
                         command=self._apply_transparency).pack(side='left')
-        self.enhance_check = ttk.Checkbutton(overlay, text='滚轮/点击增强', variable=self.enhance,
-                                             command=self._sync_hook)
-        self.enhance_check.pack(side='left', padx=(14, 0))
         self.opacity_scale = tk.Scale(overlay, from_=30, to=100, orient='horizontal', variable=self.panel_opacity,
                                       command=lambda _value: self._apply_opacity(), length=160, showvalue=True,
                                       bg=WINDOW_BG, fg='#d7e4ee', troughcolor='#142231', activebackground='#2a4763',
@@ -150,17 +123,18 @@ class App:
                                       font=('Microsoft YaHei UI', 9))
         self.opacity_scale.pack(side='left', padx=(18, 0))
 
+        # 高价规格提示：有超过 100 万的规格时才出现。
+        self.hint = ttk.Label(frame, text='', foreground='#ffd979', font=('Microsoft YaHei UI', 10))
         # 状态行只在有话说的时候才出现。
         self.status_label = ttk.Label(frame, textvariable=self.status, foreground='#85bce9')
 
         result_frame = ttk.Frame(frame)
         self.result_frame = result_frame
         result_frame.pack(fill='both', expand=True, pady=(0, 8))
-        self.results = tk.Text(result_frame, height=18, wrap='word', bg=WINDOW_BG, fg='#d7e4ee',
-                               insertbackground='white', font=('Microsoft YaHei UI', 10), relief='flat',
-                               padx=15, pady=12, state='disabled')
-        self.results.pack(side='left', fill='both', expand=True)
-        self.results.bind('<MouseWheel>', self._on_native_wheel)
+        self.results = tk.Frame(result_frame, bg=WINDOW_BG)
+        self.results.pack(fill='both', expand=True)
+        self.results.columnconfigure(0, weight=1, uniform='column')
+        self.results.columnconfigure(1, weight=1, uniform='column')
 
     def _alert(self, title: str, message: str) -> None:
         """置顶对话框：Tk 的 messagebox 会被置顶主窗挡住。"""
@@ -205,7 +179,6 @@ class App:
             self.root.deiconify()
             self._toggle_pin()
             self.root.lift()
-            self._update_rects()
         else:
             self.root.withdraw()
 
@@ -231,9 +204,6 @@ class App:
         except tk.TclError:
             self.bg_transparent.set(False)
             self.status.set('当前系统不支持背景透明，已关闭该选项。')
-        self.enhance_check.configure(state='normal' if self.bg_transparent.get() else 'disabled')
-        self._update_rects()
-        self._sync_hook()
 
     def _apply_opacity(self) -> None:
         """整窗淡出，让游戏画面透过来。"""
@@ -249,111 +219,6 @@ class App:
         elif not text and self.status_label.winfo_manager():
             self.status_label.pack_forget()
 
-    # ---------- 鼠标钩子（按需） ----------
-
-    def _pointer_inside(self) -> bool:
-        try:
-            if self.root.state() != 'normal':
-                return False
-            x, y = self.root.winfo_pointerxy()
-            left, top = self.root.winfo_rootx(), self.root.winfo_rooty()
-            return left <= x <= left + self.root.winfo_width() and top <= y <= top + self.root.winfo_height()
-        except tk.TclError:
-            return False
-
-    def _sync_hook(self) -> None:
-        """只在需要且鼠标位于窗口内时挂着钩子，其余时间一律卸掉。"""
-        try:
-            needed = self.enhance.get() and self.bg_transparent.get() and self._pointer_inside()
-            if needed and not self.hook.installed:
-                self._update_rects()
-                self.hook.install()
-            elif not needed and self.hook.installed:
-                self.hook.uninstall()
-        except Exception as exc:
-            log_error('同步鼠标钩子失败', exc)
-        self.root.after(120, self._sync_hook)
-
-    def _on_mouse(self, wparam: int, info) -> bool:
-        """钩子回调：滚轮交给列表；会被系统丢掉的控件点击补发一次。"""
-        x, y = info.pt.x, info.pt.y
-        if wparam == WM_MOUSEWHEEL and _inside(self._wheel_rects, x, y):
-            self.messages.put(('wheel', ctypes.c_short((info.mouseData >> 16) & 0xFFFF).value))
-            return True
-        if wparam == WM_LBUTTONDOWN and _inside(self._click_rects, x, y) and self._click_would_get_lost(x, y):
-            self.messages.put(('click', x, y))
-            return True
-        return False
-
-    def _interactive_widgets(self) -> list:
-        """不能被漏掉点击的控件：按钮、下拉、勾选框、滑块。"""
-        found = []
-
-        def walk(widget) -> None:
-            for child in widget.winfo_children():
-                if child.winfo_class() in ('TButton', 'TCombobox', 'TCheckbutton', 'Scale'):
-                    found.append(child)
-                walk(child)
-
-        walk(self.root)
-        return found
-
-    def _rects(self, rects: list[tuple]) -> tuple:
-        """同一批矩形，分别用 Tk 的逻辑像素和钩子的物理像素表示。"""
-        logical = [tuple(rect) for rect in rects]
-        if self.dpi_scale == 1.0:
-            return tuple(logical)
-        return tuple(logical) + tuple(tuple(value * self.dpi_scale for value in rect) for rect in logical)
-
-    def _update_rects(self, _event=None) -> None:
-        try:
-            if self.root.state() in ('iconic', 'withdrawn') or not self.results.winfo_ismapped():
-                self._wheel_rects = ()
-                self._click_rects = ()
-                return
-            left, top = self.results.winfo_rootx(), self.results.winfo_rooty()
-            results_rect = (left, top, left + self.results.winfo_width(), top + self.results.winfo_height())
-            controls = []
-            for widget in self._interactive_widgets():
-                if not widget.winfo_ismapped():
-                    continue
-                x, y = widget.winfo_rootx(), widget.winfo_rooty()
-                controls.append((x, y, x + widget.winfo_width(), y + widget.winfo_height()))
-            self._wheel_rects = self._rects([results_rect])
-            self._click_rects = self._rects(controls) if controls else ()
-        except tk.TclError:
-            self._wheel_rects = ()
-            self._click_rects = ()
-
-    def _click_would_get_lost(self, x: int, y: int) -> bool:
-        """Windows 会把这次按下派给别的进程（抠色区或被别的窗口压着）时为真。"""
-        try:
-            user32 = ctypes.windll.user32
-            hwnd = user32.WindowFromPoint(HookPoint(x, y))
-            if not hwnd:
-                return True
-            pid = ctypes.c_ulong()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            return pid.value != ctypes.windll.kernel32.GetCurrentProcessId()
-        except Exception as exc:
-            log_error('判断点击归属失败', exc)
-            return False
-
-    def _replay_click(self, x: int, y: int) -> None:
-        """把系统送错地方的按下补发给光标下的控件。"""
-        try:
-            logical_x, logical_y = int(x / self.dpi_scale), int(y / self.dpi_scale)
-            widget = self.root.winfo_containing(logical_x, logical_y)
-            if widget is None:
-                return
-            local_x = logical_x - widget.winfo_rootx()
-            local_y = logical_y - widget.winfo_rooty()
-            self.root.focus_force()
-            widget.event_generate('<ButtonPress-1>', x=local_x, y=local_y, when='now')
-            widget.event_generate('<ButtonRelease-1>', x=local_x, y=local_y, when='now')
-        except tk.TclError as exc:
-            log_error('补发点击失败', exc)
-
     def _keep_popups_usable(self) -> None:
         """下拉列表也是独立窗口，保持在置顶面板之上，否则看起来像点了没反应。"""
         try:
@@ -366,14 +231,6 @@ class App:
         except tk.TclError as exc:
             log_error('保持下拉弹层失败', exc)
         self.root.after(800, self._keep_popups_usable)
-
-    def _on_native_wheel(self, event) -> str:
-        """不透明时 Tk 默认一格滚两行，统一成一格一行。"""
-        self._wheel_pending += event.delta
-        steps, self._wheel_pending = divmod(self._wheel_pending, WHEEL_LINE)
-        if steps:
-            self.results.yview_scroll(-steps, 'units')
-        return 'break'
 
     # ---------- 录音与识别 ----------
 
@@ -435,15 +292,6 @@ class App:
             except queue.Empty:
                 break
             kind = message[0]
-            if kind == 'wheel':
-                self._wheel_pending += message[1]
-                steps, self._wheel_pending = divmod(self._wheel_pending, WHEEL_LINE)
-                if steps:
-                    self.results.yview_scroll(-steps, 'units')
-                continue
-            if kind == 'click':
-                self._replay_click(message[1], message[2])
-                continue
             if kind == 'hotkey':
                 self._on_hotkey(message[1])
                 continue
@@ -502,24 +350,44 @@ class App:
         score_label = f'匹配分 {score*100:.0f}/100' if metric == 'cos' else f'音效峰值强度 {score:.1f}'
         self.last_confidence = confidence
         self.status.set('已识别。可用货物占格进一步筛选候选物品。')
-        self._render(ranked[:3], metric)
+        self._render(ranked[:1], metric)
 
-    # ---------- 结果列表 ----------
+    # ---------- 结果区（两列） ----------
 
-    def _insert_row(self, segments: list[tuple[str, str, int, bool]], pady: int = 3) -> None:
+    def _row_photo(self, segments: list[tuple[str, str, int, bool]]) -> ImageTk.PhotoImage:
         photo = ImageTk.PhotoImage(stroked_line(segments))
         self.photos.append(photo)
-        self.results.image_create('end', image=photo, pady=pady)
-        self.results.insert('end', '\n')
+        return photo
+
+    def _update_buy_hint(self, ranked: list[tuple[int, str, float]]) -> None:
+        """某个音效组的某个规格里有超过 100 万的物品，就提示该买哪个规格。"""
+        best: dict[tuple[int, int], int] = {}
+        for sound_id, _action, _score in ranked:
+            for item in catalog()['items']:
+                if item['soundId'] != sound_id:
+                    continue
+                price = item.get('contactPrice') or 0
+                if price > HIGH_VALUE_PRICE:
+                    key = tuple(item['size'])
+                    best[key] = max(best.get(key, 0), price)
+        if not best:
+            self.hint.pack_forget()
+            return
+        text = '、'.join(f'买{a}×{b}' for a, b in sorted(best, key=lambda size: -best[size]))
+        self.hint.configure(text=text)
+        if not self.hint.winfo_manager():
+            self.hint.pack(anchor='w', pady=(0, 6), before=self.result_frame)
 
     def _render(self, ranked: list[tuple[int, str, float]], metric: str = 'cos') -> None:
         self.last_ranked = ranked
         self.last_metric = metric
         size = self.size.get()
-        self.results.configure(state='normal')
-        self.results.delete('1.0', 'end')
+        for child in self.results.winfo_children():
+            child.destroy()
         self.photos.clear()
-        for index, (sound_id, action, score) in enumerate(ranked, 1):
+        self._update_buy_hint(ranked)
+        row = 0
+        for sound_id, action, score in ranked:
             items = [item for item in catalog()['items'] if item['soundId'] == sound_id]
             if size != '不限':
                 a, b = map(int, size.split('×'))
@@ -527,28 +395,35 @@ class App:
             score_label = f'匹配分 {score*100:.0f}/100' if metric == 'cos' else f'音效峰值强度 {score:.1f}'
             action_label = '拾起' if action == 'pickup' else '放下'
             extra = f' · {self.last_confidence}' if self.last_confidence else ''
-            header = f'{index}. 音效组 {sound_id} · {action_label}音效 · {score_label}{extra} · {len(items)} 件符合占格'
-            self._insert_row([(header, '#9ad8f5', 12, True)], pady=9 if index > 1 else 3)
-            if items:
-                for item in sorted(items, key=lambda entry: entry.get('contactPrice') or 0, reverse=True):
-                    price = item.get('contactPrice') or 0
-                    category = item.get('category', '')
-                    high = price > HIGH_VALUE_PRICE
-                    self._insert_row([
-                        (item['nameZh'], '#f4f9fd', 12, False),
-                        (f"{item['size'][0]}×{item['size'][1]}", '#7fd4f5', 10, False),
-                        (f'{price:,}', '#ff4d4f' if high else '#ffffff', 11, high),
-                        (CATEGORY_ZH.get(category, category or '未分类'), '#ffd979', 10, False),
-                    ])
-            else:
-                self._insert_row([('当前占格没有候选物品；请核对占格或再录一次。', '#7fd4f5', 10, False)])
-        self.results.configure(state='disabled')
-        self.results.yview_moveto(0)
+            header = f'音效组 {sound_id} · {action_label}音效 · {score_label}{extra} · {len(items)} 件符合占格'
+            tk.Label(self.results, image=self._row_photo([(header, '#9ad8f5', 12, True)]),
+                     bg=WINDOW_BG, bd=0, anchor='w').grid(
+                row=row, column=0, columnspan=2, sticky='w', pady=(8 if row else 2, 3))
+            row += 1
+            if not items:
+                tk.Label(self.results,
+                         image=self._row_photo([('当前占格没有候选物品；请核对占格或再录一次。', '#7fd4f5', 10, False)]),
+                         bg=WINDOW_BG, bd=0, anchor='w').grid(row=row, column=0, columnspan=2, sticky='w', pady=2)
+                row += 1
+                continue
+            ordered = sorted(items, key=lambda entry: entry.get('contactPrice') or 0, reverse=True)
+            for index, item in enumerate(ordered):
+                price = item.get('contactPrice') or 0
+                category = item.get('category', '')
+                high = price > HIGH_VALUE_PRICE
+                photo = self._row_photo([
+                    (item['nameZh'], '#f4f9fd', 12, False),
+                    (f"{item['size'][0]}×{item['size'][1]}", '#7fd4f5', 10, False),
+                    (f'{price:,}', '#ff4d4f' if high else '#ffffff', 11, high),
+                    (CATEGORY_ZH.get(category, category or '未分类'), '#ffd979', 10, False),
+                ])
+                tk.Label(self.results, image=photo, bg=WINDOW_BG, bd=0, anchor='w').grid(
+                    row=row + index // 2, column=index % 2, sticky='w', padx=(0, 10), pady=1)
+            row += (len(ordered) + 1) // 2
 
     def _close(self) -> None:
         self.listening = False
         self.hotkeys.stop()
-        self.hook.uninstall()
         self.root.destroy()
 
 
