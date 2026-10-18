@@ -111,6 +111,8 @@ class App:
         ttk.Checkbutton(controls, text='自动尝试识别', variable=self.auto).pack(side='left', padx=10)
         ttk.Checkbutton(controls, text='窗口置顶', variable=self.pin_window,
                         command=self._toggle_pin).pack(side='left', padx=10)
+        # 高价规格提示：放在控制区右侧，字号比其它控件略大，有超过 100 万的规格时才出现。
+        self.hint = ttk.Label(controls, text='', foreground='#ffd979', font=('Microsoft YaHei UI', 12))
 
         overlay = ttk.Frame(frame)
         overlay.pack(fill='x', pady=(0, 8))
@@ -123,8 +125,6 @@ class App:
                                       font=('Microsoft YaHei UI', 9))
         self.opacity_scale.pack(side='left', padx=(18, 0))
 
-        # 高价规格提示：有超过 100 万的规格时才出现。
-        self.hint = ttk.Label(frame, text='', foreground='#ffd979', font=('Microsoft YaHei UI', 10))
         # 状态行只在有话说的时候才出现。
         self.status_label = ttk.Label(frame, textvariable=self.status, foreground='#85bce9')
 
@@ -376,7 +376,7 @@ class App:
         text = '、'.join(f'买{a}×{b}' for a, b in sorted(best, key=lambda size: -best[size]))
         self.hint.configure(text=text)
         if not self.hint.winfo_manager():
-            self.hint.pack(anchor='w', pady=(0, 6), before=self.result_frame)
+            self.hint.pack(side='right', padx=(12, 0))
 
     def _render(self, ranked: list[tuple[int, str, float]], metric: str = 'cos') -> None:
         self.last_ranked = ranked
