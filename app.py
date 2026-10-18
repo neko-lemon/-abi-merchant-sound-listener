@@ -35,9 +35,9 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title('暗区战地商人 · 听声识物')
-        width, height = 688, min(573, root.winfo_screenheight() - 80)  # 默认 860x860 的五分之四宽、三分之二高
+        width, height = 860, min(860, root.winfo_screenheight() - 80)
         root.geometry(f'{width}x{height}')
-        root.minsize(560, 420)
+        root.minsize(720, 520)
 
         self.matcher: Matcher | None = None
         self.devices = [mic for mic in sc.all_microphones(include_loopback=True) if mic.isloopback]
@@ -382,7 +382,7 @@ class App:
         self._hint_photo = photo
         self.hint.configure(image=photo)
         if not self.hint.winfo_manager():
-            self.hint.pack(side='left', padx=(16, 0))
+            self.hint.pack(side='left', padx=(48, 0))
 
     # ---------- 结果区（两列，随窗口缩放） ----------
 
