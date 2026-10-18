@@ -363,16 +363,17 @@ class App:
     # ---------- 高价规格提示 ----------
 
     def _update_buy_hint(self, ranked: list[tuple[int, str, float]]) -> None:
-        """某个音效组的某个规格里有超过 100 万的物品，就提示该买哪个规格。"""
+        """该组某个规格里的物品全部超过 100 万（没有便宜货）才提示该买哪个规格。"""
         best: dict[tuple[int, int], int] = {}
         for sound_id, _action, _score in ranked:
+            prices_by_size: dict[tuple[int, int], list[int]] = {}
             for item in catalog()['items']:
                 if item['soundId'] != sound_id:
                     continue
-                price = item.get('contactPrice') or 0
-                if price > HIGH_VALUE_PRICE:
-                    key = tuple(item['size'])
-                    best[key] = max(best.get(key, 0), price)
+                prices_by_size.setdefault(tuple(item['size']), []).append(item.get('contactPrice') or 0)
+            for size, prices in prices_by_size.items():
+                if prices and all(price > HIGH_VALUE_PRICE for price in prices):
+                    best[size] = max(best.get(size, 0), max(prices))
         if not best:
             self.hint.pack_forget()
             self._hint_photo = None
