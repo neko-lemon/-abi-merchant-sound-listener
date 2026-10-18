@@ -26,6 +26,8 @@ HOTKEY_LISTEN = 1
 HOTKEY_HIDE = 2
 HOTKEY_KEYS = {(MOD_ALT, 0x34): HOTKEY_LISTEN, (MOD_ALT, 0x35): HOTKEY_HIDE}  # Alt+4 / Alt+5
 MIN_SCALE = 0.55
+MIN_SIMILARITY = 0.50  # 低于这个匹配分不算识别成功
+RESULT_TTL = 5.0       # 这么久没有合格声音就把结果收起来
 HINT_COLOR = '#ff4d4f'
 
 Row = tuple[list[tuple[str, str, int, bool]], int, int]  # (分段, 跨列数, 上边距)
@@ -60,9 +62,9 @@ class App:
         self.messages: queue.Queue = queue.Queue()
         self.last_auto = 0.0
         self.last_match = (None, 0.0)
+        self.last_confident = 0.0
         self.tentative: tuple[int, float, int] | None = None
         self.last_ranked: list[tuple[int, str, float]] = []
-        self.last_metric = 'cos'
         self.photos: list[ImageTk.PhotoImage] = []
         self._hint_photo: ImageTk.PhotoImage | None = None
         self._resize_job: str | None = None
@@ -110,7 +112,7 @@ class App:
         self.size_combo = size_combo
         size_combo.pack(side='left', padx=8)
         size_combo.bind('<<ComboboxSelected>>',
-                        lambda _event: self._render(self.last_ranked, self.last_metric) if self.last_ranked else None)
+                        lambda _event: self._render(self.last_ranked) if self.last_ranked else None)
         # 高价规格提示：紧跟在占格下拉框右边，红色描边大字，有超过 100 万的规格时才出现。
         self.hint = tk.Label(size_row, bg=WINDOW_BG, bd=0)
 
@@ -281,8 +283,8 @@ class App:
 
     def _recognize(self, snapshot: np.ndarray) -> None:
         try:
-            ranked, prominent = self.matcher.match_with_prominence(snapshot, CAPTURE_RATE, fast=True)
-            self.messages.put(('match', ranked, prominent))
+            ranked, _prominent = self.matcher.match_with_prominence(snapshot, CAPTURE_RATE, fast=True)
+            self.messages.put(('match', ranked))
         except Exception as exc:
             log_error('识别失败', exc)
             self.messages.put(('error', f'识别失败：{exc}'))
@@ -292,6 +294,8 @@ class App:
         if self.listening and self.auto.get() and now - self.last_auto > 0.25:
             self.last_auto = now
             self._submit()
+        if self.last_ranked and now - self.last_confident > RESULT_TTL:
+            self._clear_results()
         self.root.after(250, self._auto_tick)
 
     def _drain_messages(self) -> None:
@@ -318,47 +322,46 @@ class App:
                 self.listening = False
                 self.listen_button.configure(text='开始监听')
             elif kind == 'match':
-                self._show(message[1], message[2])
+                self._show(message[1])
         self.root.after(75, self._drain_messages)
 
-    def _show(self, ranked: list[tuple[int, str, float]], prominent: list[tuple[int, str, float]]) -> None:
-        if not ranked and not prominent:
-            return
-        cos_score = ranked[0][2] if ranked else 0.0
-        cos_gap = cos_score - (ranked[1][2] if len(ranked) > 1 else 0.0)
-        peak_score = prominent[0][2] if prominent else 0.0
-        peak_gap = peak_score - (prominent[1][2] if len(prominent) > 1 else 0.0)
-        if cos_score >= 0.24 and cos_gap >= 0.12:
-            metric = 'cos'
-        elif peak_score >= 7.0 and peak_gap >= 2.0:
-            metric = 'peak'
-            ranked = prominent
-        else:
-            self.tentative = None
+    def _show(self, ranked: list[tuple[int, str, float]]) -> None:
+        """只接受相似度超过 50% 的声音，取其中最高的一个显示。"""
+        if not ranked:
             return
         sound_id, action, score = ranked[0]
-        gap = score - (ranked[1][2] if len(ranked) > 1 else 0.0)
-        if metric == 'peak':
-            confidence = '音乐抗干扰匹配，建议复核'
-        elif score >= 0.40 and gap >= 0.15:
-            confidence = '快速匹配'
-        else:
-            confidence = '低音量匹配，建议复核'
+        if score <= MIN_SIMILARITY:
+            self.tentative = None
+            return
         now = time.monotonic()
+        # 听到合格声音就续命：即使结果被去重挡下，5 秒消失的计时也要重置。
+        self.last_confident = now
+        confidence = '匹配明确' if score >= 0.65 else '建议复核'
         previous = self.tentative
         count = previous[2] + 1 if previous and previous[0] == sound_id and now - previous[1] <= 1.0 else 1
         self.tentative = (sound_id, now, count)
-        # 连续两次同一候选才算数；分数特别高时一次就认。
-        if count < 2 and not (metric == 'cos' and score >= 0.75 and gap >= 0.30):
-            return
-        if self.last_match[0] != sound_id and now - self.last_match[1] < 0.75 and (metric == 'peak' or score < 0.75):
+        # 连续两次同一候选才更新；分数很高时一次就认。
+        if count < 2 and score < 0.75:
             return
         if self.last_match[0] == sound_id and now - self.last_match[1] < 3:
             return
         self.last_match = (sound_id, now)
         self.last_confidence = confidence
         self.status.set('已识别。可用货物占格进一步筛选候选物品。')
-        self._render(ranked[:1], metric)
+        self._render([(sound_id, action, score)])
+
+    def _clear_results(self) -> None:
+        """5 秒没有合格声音：把结果和「买X×Y」提示一起收掉。"""
+        self.last_ranked = []
+        self.last_match = (None, 0.0)
+        self.tentative = None
+        for child in self.results.winfo_children():
+            child.destroy()
+        self.photos.clear()
+        self.hint.pack_forget()
+        self._hint_photo = None
+        if self.status.get().startswith('已识别'):
+            self.status.set('')
 
     # ---------- 高价规格提示 ----------
 
@@ -387,7 +390,7 @@ class App:
 
     # ---------- 结果区（两列，随窗口缩放） ----------
 
-    def _build_rows(self, ranked: list[tuple[int, str, float]], metric: str) -> list[Row]:
+    def _build_rows(self, ranked: list[tuple[int, str, float]]) -> list[Row]:
         """把结果拆成待排的行：标题跨两列，物品两列交替。"""
         size = self.size.get()
         rows: list[Row] = []
@@ -396,7 +399,7 @@ class App:
             if size != '不限':
                 a, b = map(int, size.split('×'))
                 items = [item for item in items if sorted(item['size']) == sorted([a, b])]
-            score_label = f'匹配分 {score*100:.0f}/100' if metric == 'cos' else f'音效峰值强度 {score:.1f}'
+            score_label = f'匹配分 {score*100:.0f}/100'
             action_label = '拾起' if action == 'pickup' else '放下'
             extra = f' · {self.last_confidence}' if self.last_confidence else ''
             header = f'音效组 {sound_id} · {action_label}音效 · {score_label}{extra} · {len(items)} 件符合占格'
@@ -452,11 +455,10 @@ class App:
         self.photos.append(photo)
         return photo
 
-    def _render(self, ranked: list[tuple[int, str, float]], metric: str = 'cos') -> None:
+    def _render(self, ranked: list[tuple[int, str, float]]) -> None:
         self.last_ranked = ranked
-        self.last_metric = metric
         self._update_buy_hint(ranked)
-        rows = self._build_rows(ranked, metric)
+        rows = self._build_rows(ranked)
         for child in self.results.winfo_children():
             child.destroy()
         self.photos.clear()
@@ -502,7 +504,7 @@ class App:
             return
         size = (self.results.winfo_width(), self.results.winfo_height())
         if size != self._last_render_size and size[0] > 0 and size[1] > 0:
-            self._render(self.last_ranked, self.last_metric)
+            self._render(self.last_ranked)
 
     def _close(self) -> None:
         self.listening = False
