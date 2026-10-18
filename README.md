@@ -34,6 +34,32 @@ bash tools/build_exe.sh
 
 产物为 `dist/商人听金.exe`（单文件、无控制台）；脚本结束时会自动清掉 `build/` 与 `.spec` 中间文件。脚本会先运行 `tools/patch_scipy_for_pyinstaller.py`：scipy 的 `stats/_distn_infrastructure.py` 末尾用模块级 `dir()` + `exec('del ...')` 清理临时字符串，这个写法在 PyInstaller 冻结环境里会抛 `NameError: name 'obj' is not defined`，导致 exe 启动即崩。补丁把该段换成等价函数（`tools/patch_scipy_for_pyinstaller.py`，幂等）。**重装依赖后需重新运行一次该脚本，或直接跑 `tools/build_exe.sh`。**
 
+打包完可以跑一次自检（启动 exe、确认窗口出现、进程存活、没有新的错误日志）：
+
+```bash
+.venv/Scripts/python.exe tools/smoke_test.py dist/商人听金.exe
+```
+
+## 发布 Release
+
+本地一键（构建 → 自检 → 打标签 → 推送 → 建 Release → 上传 exe）：
+
+```bash
+bash tools/release.sh                 # 自动把最新 vX.Y.Z 的补丁号 +1
+bash tools/release.sh v1.2.0          # 指定版本
+bash tools/release.sh v1.2.0 --draft --prerelease
+bash tools/release.sh --dry-run       # 只构建、自检并打印计划，不动远端
+```
+
+认证二选一：`gh auth login`（推荐，脚本会自动用它），或 `export GITHUB_TOKEN=<带 repo 权限的 PAT>`。
+
+也可以交给 GitHub Actions：`.github/workflows/release.yml` 会在推送 `v*` 标签（或手动触发）时，在 Windows runner 上自动构建并挂到 Release：
+
+```bash
+git tag -a v1.2.0 -m v1.2.0
+git push origin v1.2.0
+```
+
 ## 测试范围
 
 `docs/逐组召回测试报告.md` 列出了 38 组音效各自的拾起、放下测试。每段参考音效在四种模拟背景下测试，共 304 次；安静、低频音乐和宽带杂音场景各为 76/76，高频音乐为 74/76。这是参考音效混音测试，不代表真实游戏环境的召回率。
