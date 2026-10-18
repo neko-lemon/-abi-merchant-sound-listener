@@ -31,7 +31,7 @@ class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title('暗区战地商人 · 听声识物')
-        root.geometry('860x640')
+        root.geometry(f'860x{min(860, root.winfo_screenheight() - 80)}')
         root.minsize(720, 520)
 
         self.matcher: Matcher | None = None
