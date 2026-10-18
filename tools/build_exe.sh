@@ -9,6 +9,12 @@ PYTHON="${PYTHON:-./.venv/Scripts/python.exe}"
 # scipy 的 _distn_infrastructure.py 在冻结环境下会崩溃，先打补丁（幂等）
 "$PYTHON" tools/patch_scipy_for_pyinstaller.py
 
+# 正在运行的 exe 会锁住 dist 里的文件；先删旧产物，删不掉说明程序还开着。
+if ! rm -f "dist/商人听金.exe" 2>/dev/null; then
+  echo "dist/商人听金.exe 正被占用（程序还在运行？）先关掉它再打包" >&2
+  exit 1
+fi
+
 "$PYTHON" -m PyInstaller --noconfirm --clean --onefile --windowed \
   --name 商人听金 \
   --add-data "catalog.json;." \
