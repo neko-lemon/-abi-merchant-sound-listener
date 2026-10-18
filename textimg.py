@@ -27,20 +27,39 @@ def yahei(point_size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     return font
 
 
-def stroked_line(segments: list[tuple[str, str, int, bool]], gap: float = 8.0, indent: float = 12.0) -> Image.Image:
-    """把一行分段的彩色文字画成一张带黑色描边的透明底图。"""
+def _layout(
+    segments: list[tuple[str, str, int, bool]], gap: float, indent: float, scale: float
+) -> tuple[list[tuple[str, str, ImageFont.FreeTypeFont, float, int, int]], int, int, int, int]:
+    """把一段分段文字排成一行：返回 (各段信息, 宽, 高, 基线, 描边宽度)。"""
+    stroke = max(1, round(STROKE_WIDTH * scale))
     parts = []
     for text, color, point_size, bold in segments:
-        font = yahei(point_size, bold)
+        font = yahei(max(6, round(point_size * scale)), bold)
         ascent, descent = font.getmetrics()
         parts.append((text, color, font, float(font.getlength(text)), ascent, descent))
-    width = indent + sum(part[3] for part in parts) + gap * max(0, len(parts) - 1) + STROKE_WIDTH * 2 + 2
-    baseline = max(part[4] for part in parts) + STROKE_WIDTH + 1
-    height = baseline + max(part[5] for part in parts) + STROKE_WIDTH + 1
-    image = Image.new('RGBA', (int(width), int(height)), (0, 0, 0, 0))
+    width = indent * scale + sum(part[3] for part in parts) + gap * scale * max(0, len(parts) - 1) + stroke * 2 + 2
+    baseline = max(part[4] for part in parts) + stroke + 1
+    height = baseline + max(part[5] for part in parts) + stroke + 1
+    return parts, max(1, int(width)), max(1, int(height)), baseline, stroke
+
+
+def measure_line(
+    segments: list[tuple[str, str, int, bool]], gap: float = 8.0, indent: float = 12.0, scale: float = 1.0
+) -> tuple[int, int]:
+    """只算尺寸，不画图（用于按窗口大小选缩放比例）。"""
+    _parts, width, height, _baseline, _stroke = _layout(segments, gap, indent, scale)
+    return width, height
+
+
+def stroked_line(
+    segments: list[tuple[str, str, int, bool]], gap: float = 8.0, indent: float = 12.0, scale: float = 1.0
+) -> Image.Image:
+    """把一行分段的彩色文字画成一张带黑色描边的透明底图。"""
+    parts, width, height, baseline, stroke = _layout(segments, gap, indent, scale)
+    image = Image.new('RGBA', (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    x = indent + STROKE_WIDTH
+    x = indent * scale + stroke
     for text, color, font, length, ascent, _descent in parts:
-        draw.text((x, baseline - ascent), text, font=font, fill=color, stroke_width=STROKE_WIDTH, stroke_fill='black')
-        x += length + gap
+        draw.text((x, baseline - ascent), text, font=font, fill=color, stroke_width=stroke, stroke_fill='black')
+        x += length + gap * scale
     return image

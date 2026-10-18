@@ -15,7 +15,7 @@ from PIL import ImageTk
 
 from matcher import CAPTURE_RATE, Matcher
 from resources import CATEGORY_ZH, catalog
-from textimg import stroked_line
+from textimg import measure_line, stroked_line
 from winutil import Hotkeys, log_error, log_path
 
 WINDOW_BG = '#101824'
@@ -25,14 +25,19 @@ MOD_ALT = 0x0001
 HOTKEY_LISTEN = 1
 HOTKEY_HIDE = 2
 HOTKEY_KEYS = {(MOD_ALT, 0x34): HOTKEY_LISTEN, (MOD_ALT, 0x35): HOTKEY_HIDE}  # Alt+4 / Alt+5
+MIN_SCALE = 0.55
+HINT_COLOR = '#ff4d4f'
+
+Row = tuple[list[tuple[str, str, int, bool]], int, int]  # (分段, 跨列数, 上边距)
 
 
 class App:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         root.title('暗区战地商人 · 听声识物')
-        root.geometry(f'860x{min(860, root.winfo_screenheight() - 80)}')
-        root.minsize(720, 520)
+        width, height = 688, min(573, root.winfo_screenheight() - 80)  # 默认 860x860 的五分之四宽、三分之二高
+        root.geometry(f'{width}x{height}')
+        root.minsize(560, 420)
 
         self.matcher: Matcher | None = None
         self.devices = [mic for mic in sc.all_microphones(include_loopback=True) if mic.isloopback]
@@ -59,6 +64,9 @@ class App:
         self.last_ranked: list[tuple[int, str, float]] = []
         self.last_metric = 'cos'
         self.photos: list[ImageTk.PhotoImage] = []
+        self._hint_photo: ImageTk.PhotoImage | None = None
+        self._resize_job: str | None = None
+        self._last_render_size = (0, 0)
         self.hotkeys = Hotkeys(HOTKEY_KEYS)
 
         self._build()
@@ -103,6 +111,8 @@ class App:
         size_combo.pack(side='left', padx=8)
         size_combo.bind('<<ComboboxSelected>>',
                         lambda _event: self._render(self.last_ranked, self.last_metric) if self.last_ranked else None)
+        # 高价规格提示：紧跟在占格下拉框右边，红色描边大字，有超过 100 万的规格时才出现。
+        self.hint = tk.Label(size_row, bg=WINDOW_BG, bd=0)
 
         controls = ttk.Frame(frame)
         controls.pack(fill='x', pady=15)
@@ -111,8 +121,6 @@ class App:
         ttk.Checkbutton(controls, text='自动尝试识别', variable=self.auto).pack(side='left', padx=10)
         ttk.Checkbutton(controls, text='窗口置顶', variable=self.pin_window,
                         command=self._toggle_pin).pack(side='left', padx=10)
-        # 高价规格提示：放在控制区右侧，字号比其它控件略大，有超过 100 万的规格时才出现。
-        self.hint = ttk.Label(controls, text='', foreground='#ffd979', font=('Microsoft YaHei UI', 12))
 
         overlay = ttk.Frame(frame)
         overlay.pack(fill='x', pady=(0, 8))
@@ -135,6 +143,7 @@ class App:
         self.results.pack(fill='both', expand=True)
         self.results.columnconfigure(0, weight=1, uniform='column')
         self.results.columnconfigure(1, weight=1, uniform='column')
+        self.results.bind('<Configure>', self._on_results_resize)
 
     def _alert(self, title: str, message: str) -> None:
         """置顶对话框：Tk 的 messagebox 会被置顶主窗挡住。"""
@@ -347,17 +356,11 @@ class App:
         if self.last_match[0] == sound_id and now - self.last_match[1] < 3:
             return
         self.last_match = (sound_id, now)
-        score_label = f'匹配分 {score*100:.0f}/100' if metric == 'cos' else f'音效峰值强度 {score:.1f}'
         self.last_confidence = confidence
         self.status.set('已识别。可用货物占格进一步筛选候选物品。')
         self._render(ranked[:1], metric)
 
-    # ---------- 结果区（两列） ----------
-
-    def _row_photo(self, segments: list[tuple[str, str, int, bool]]) -> ImageTk.PhotoImage:
-        photo = ImageTk.PhotoImage(stroked_line(segments))
-        self.photos.append(photo)
-        return photo
+    # ---------- 高价规格提示 ----------
 
     def _update_buy_hint(self, ranked: list[tuple[int, str, float]]) -> None:
         """某个音效组的某个规格里有超过 100 万的物品，就提示该买哪个规格。"""
@@ -372,22 +375,22 @@ class App:
                     best[key] = max(best.get(key, 0), price)
         if not best:
             self.hint.pack_forget()
+            self._hint_photo = None
             return
-        text = '、'.join(f'买{a}×{b}' for a, b in sorted(best, key=lambda size: -best[size]))
-        self.hint.configure(text=text)
+        text = '、'.join(f'买{a}×{b}' for a, b in sorted(best, key=lambda size: -best[size])) + '！'
+        photo = ImageTk.PhotoImage(stroked_line([(text, HINT_COLOR, 14, False)], gap=0, indent=6))
+        self._hint_photo = photo
+        self.hint.configure(image=photo)
         if not self.hint.winfo_manager():
-            self.hint.pack(side='right', padx=(12, 0))
+            self.hint.pack(side='left', padx=(16, 0))
 
-    def _render(self, ranked: list[tuple[int, str, float]], metric: str = 'cos') -> None:
-        self.last_ranked = ranked
-        self.last_metric = metric
+    # ---------- 结果区（两列，随窗口缩放） ----------
+
+    def _build_rows(self, ranked: list[tuple[int, str, float]], metric: str) -> list[Row]:
+        """把结果拆成待排的行：标题跨两列，物品两列交替。"""
         size = self.size.get()
-        for child in self.results.winfo_children():
-            child.destroy()
-        self.photos.clear()
-        self._update_buy_hint(ranked)
-        row = 0
-        for sound_id, action, score in ranked:
+        rows: list[Row] = []
+        for index, (sound_id, action, score) in enumerate(ranked):
             items = [item for item in catalog()['items'] if item['soundId'] == sound_id]
             if size != '不限':
                 a, b = map(int, size.split('×'))
@@ -396,30 +399,109 @@ class App:
             action_label = '拾起' if action == 'pickup' else '放下'
             extra = f' · {self.last_confidence}' if self.last_confidence else ''
             header = f'音效组 {sound_id} · {action_label}音效 · {score_label}{extra} · {len(items)} 件符合占格'
-            tk.Label(self.results, image=self._row_photo([(header, '#9ad8f5', 12, True)]),
-                     bg=WINDOW_BG, bd=0, anchor='w').grid(
-                row=row, column=0, columnspan=2, sticky='w', pady=(8 if row else 2, 3))
-            row += 1
+            rows.append(([(header, '#9ad8f5', 12, True)], 2, 8 if index else 2))
             if not items:
-                tk.Label(self.results,
-                         image=self._row_photo([('当前占格没有候选物品；请核对占格或再录一次。', '#7fd4f5', 10, False)]),
-                         bg=WINDOW_BG, bd=0, anchor='w').grid(row=row, column=0, columnspan=2, sticky='w', pady=2)
-                row += 1
+                rows.append(([('当前占格没有候选物品；请核对占格或再录一次。', '#7fd4f5', 10, False)], 2, 2))
                 continue
-            ordered = sorted(items, key=lambda entry: entry.get('contactPrice') or 0, reverse=True)
-            for index, item in enumerate(ordered):
+            for item in sorted(items, key=lambda entry: entry.get('contactPrice') or 0, reverse=True):
                 price = item.get('contactPrice') or 0
                 category = item.get('category', '')
                 high = price > HIGH_VALUE_PRICE
-                photo = self._row_photo([
-                    (item['nameZh'], '#f4f9fd', 12, False),
-                    (f"{item['size'][0]}×{item['size'][1]}", '#7fd4f5', 10, False),
-                    (f'{price:,}', '#ff4d4f' if high else '#ffffff', 11, high),
-                    (CATEGORY_ZH.get(category, category or '未分类'), '#ffd979', 10, False),
-                ])
-                tk.Label(self.results, image=photo, bg=WINDOW_BG, bd=0, anchor='w').grid(
-                    row=row + index // 2, column=index % 2, sticky='w', padx=(0, 10), pady=1)
-            row += (len(ordered) + 1) // 2
+                rows.append((
+                    [
+                        (item['nameZh'], '#f4f9fd', 12, False),
+                        (f"{item['size'][0]}×{item['size'][1]}", '#7fd4f5', 10, False),
+                        (f'{price:,}', '#ff4d4f' if high else '#ffffff', 11, high),
+                        (CATEGORY_ZH.get(category, category or '未分类'), '#ffd979', 10, False),
+                    ],
+                    1,
+                    2,
+                ))
+        return rows
+
+    @staticmethod
+    def _fit_scale(rows: list[Row], avail_w: int, avail_h: int) -> float:
+        """按可用宽高算一个缩放比例，保证两列都放得下。"""
+        need_w = 1.0
+        need_h = 0.0
+        pending: tuple[int, int] | None = None  # 同一 grid 行里的左半格 (上边距, 高度)
+        for segments, span, pady in rows:
+            width, height = measure_line(segments)
+            if span == 2:
+                if pending is not None:
+                    need_h += pending[1] + pending[0]
+                    pending = None
+                need_w = max(need_w, width)
+                need_h += height + pady
+            else:
+                need_w = max(need_w, width * 2)  # 两列等宽，半宽换算成全宽需求
+                if pending is None:
+                    pending = (pady, height)
+                else:
+                    need_h += max(pending[1], height) + max(pending[0], pady)
+                    pending = None
+        if pending is not None:
+            need_h += pending[1] + pending[0]
+        if need_w <= 1 or need_h <= 0:
+            return 1.0
+        return max(MIN_SCALE, min(1.0, (avail_w * 0.98) / need_w, (avail_h * 0.98) / need_h))
+
+    def _row_photo(self, segments: list[tuple[str, str, int, bool]], scale: float = 1.0) -> ImageTk.PhotoImage:
+        photo = ImageTk.PhotoImage(stroked_line(segments, scale=scale))
+        self.photos.append(photo)
+        return photo
+
+    def _render(self, ranked: list[tuple[int, str, float]], metric: str = 'cos') -> None:
+        self.last_ranked = ranked
+        self.last_metric = metric
+        self._update_buy_hint(ranked)
+        rows = self._build_rows(ranked, metric)
+        for child in self.results.winfo_children():
+            child.destroy()
+        self.photos.clear()
+        if not rows:
+            return
+        avail_w = max(240, self.results.winfo_width())
+        avail_h = max(180, self.results.winfo_height())
+        scale = self._fit_scale(rows, avail_w, avail_h)
+        self._last_render_size = (avail_w, avail_h)
+        grid_row = 0
+        column = 0
+        for segments, span, pady in rows:
+            photo = self._row_photo(segments, scale)
+            tk.Label(self.results, image=photo, bg=WINDOW_BG, bd=0, anchor='w').grid(
+                row=grid_row,
+                column=0 if span == 2 else column,
+                columnspan=span,
+                sticky='w',
+                padx=(0, 0 if span == 2 else int(10 * scale)),
+                pady=(max(1, round(pady * scale)), 0),
+            )
+            if span == 2:
+                grid_row += 1
+                column = 0
+            else:
+                column += 1
+                if column == 2:
+                    column = 0
+                    grid_row += 1
+
+    def _on_results_resize(self, _event=None) -> None:
+        """窗口尺寸变化后重新排版（防抖 200ms）。"""
+        if self._resize_job is not None:
+            try:
+                self.root.after_cancel(self._resize_job)
+            except tk.TclError:
+                pass
+        self._resize_job = self.root.after(200, self._rerender_for_size)
+
+    def _rerender_for_size(self) -> None:
+        self._resize_job = None
+        if not self.last_ranked:
+            return
+        size = (self.results.winfo_width(), self.results.winfo_height())
+        if size != self._last_render_size and size[0] > 0 and size[1] > 0:
+            self._render(self.last_ranked, self.last_metric)
 
     def _close(self) -> None:
         self.listening = False
